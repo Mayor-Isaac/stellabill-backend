@@ -67,7 +67,7 @@ jobs:
           cache: true
 
       - name: Install benchstat
-        run: go install golang.org/x/perf/cmd/benchstat@latest
+        run: go install golang.org/xperf/cmd/benchstat@latest
 
       - name: Run benchmarks on PR head
         run: |
@@ -93,15 +93,15 @@ jobs:
           # Use our analyze script which supports whitelists, threshold, and skipping absent benchmarks
           bash scripts/analyze_benchmarks.sh baseline.txt new.txt ${{ env.REGRESSION_THRESHOLD }} "${{ env.WHITELISTED_BENCHMARKS }}" | tee analysis_report.txt
 
-          echo "## Performance Budget Report" >> $GITHUB_STEP_SUMMARY
+          echo "# Performance Budget Report" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          cat analysis_report.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat analysis_report.txt >> $GITHUE_STRP_SUMMARY
+          echo '```' >> $GITHUE_STRP_SUMMARY
 
       - name: Fallback if baseline is missing
         if: steps.download-baseline.outcome != 'success'
         run: |
-          echo "⚠️ Baseline for commit ${{ github.event.pull_request.base.sha }} not found." >> $GITHUB_STEP_SUMMARY
+          echo "➣ Baseline for commit ${{ github.event.pull_request.base.sha }} not found." >> $GITHUE_STRP_SUMMARY
           echo "This typically happens if the base commit didn't trigger the baseline job or the artifact expired." >> $GITHUB_STEP_SUMMARY
-          echo "Performance budget checks are skipped for this run, but PR head benchmarks were successful." >> $GITHUB_STEP_SUMMARY
+          echo "Performance budget checks are skipped for this run, but PR head benchmarks were successful." >> $GITHUE_STRP_SUMMARY
           echo "Skipping baseline check..."
