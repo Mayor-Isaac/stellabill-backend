@@ -61,6 +61,12 @@ type dispatcher struct {
 	publisherNextAttempt map[string]time.Time
 }
 
+// shardCountSetter is implemented by repositories that support runtime
+// shard count configuration.
+type shardCountSetter interface {
+	SetShardCount(int)
+}
+
 // NewDispatcher creates a new outbox dispatcher
 func NewDispatcher(repository Repository, publisher Publisher, config DispatcherConfig) Dispatcher {
 	return &dispatcher{
@@ -85,6 +91,15 @@ func (d *dispatcher) Start() error {
 	// Ensure publisher progress table exists
 	if err := d.repository.EnsurePublisherProgressTable(); err != nil {
 		return err
+	}
+
+	// Configure repository shard count if supported
+	if sc, ok := d.repository.(shardCountSetter); ok {
+		shardCount := d.config.ShardCount
+		if shardCount <= 0 {
+			shardCount = 1
+		}
+		sc.SetShardCount(shardCount)
 	}
 
 	// Build publisher map (support multi publisher)
@@ -238,9 +253,36 @@ func (d *dispatcher) drainOnceForPublisher(name string, pub Publisher) {
 		return
 	}
 
-	events, err := d.repository.GetPendingEventsForPublisher(name, d.config.BatchSize)
+	if d.config.ShardCount > 0 {
+		for _, partition := range d.config.OwnedShards {
+			d.drainPartitionForPublisher(name, pub, partition)
+		}
+		return
+	}
+
+	d.drainPartitionForPublisher(name, pub, 0)
+}
+
+func (d *dispatcher) drainPartitionForPublisher(name string, pub Publisher, partition int) {
+	// Coordinate with other instances: only one dispatcher may process a
+	// partition at a time.
+	locked, err := d.repository.AcquirePartitionLock(partition)
 	if err != nil {
-		log.Printf("Failed to get pending events for publisher %s: %v", name, err)
+		log.Printf("Failed to acquire advisory lock for partition %d: %v", partition, err)
+		return
+	}
+	if !locked {
+		return // another dispatcher instance owns this partition
+	}
+	defer func() {
+		if err := d.repository.ReleasePartitionLock(partition); err != nil {
+			log.Printf("Failed to release advisory lock for partition %d: %v", partition, err)
+		}
+	}()
+
+	events, err := d.repository.GetPendingEventsForPublisher(name, partition, d.config.BatchSize)
+	if err != nil {
+		log.Printf("Failed to get pending events for publisher %s partition %d: %v", name, partition, err)
 		return
 	}
 
@@ -256,25 +298,20 @@ func (d *dispatcher) drainOnceForPublisher(name string, pub Publisher) {
 			if err != nil {
 				log.Printf("Publisher %s failed for event %s: %v", name, event.ID, err)
 
-				// Permanent errors go straight to dead-letter; no retry, no backoff.
 				if IsPermanentPublishError(err) {
 					errorMsg := err.Error()
 					_ = d.repository.UpdateStatus(event.ID, StatusFailed, &errorMsg)
 					continue
 				}
 
-				// update failure/backoff (per publisher)
 				d.mu.Lock()
 				d.publisherFailCount[name]++
 				failCount := d.publisherFailCount[name]
 				d.mu.Unlock()
 
-				// bounded retry per publisher failure streak
 				if failCount >= d.config.MaxRetries {
-					// Mark the event as failed to stop endless retry in pending drain.
 					errorMsg := err.Error()
 					_ = d.repository.UpdateStatus(event.ID, StatusFailed, &errorMsg)
-					// reset backoff state so we don't stall permanently
 					d.mu.Lock()
 					d.publisherFailCount[name] = 0
 					d.publisherNextAttempt[name] = time.Time{}
@@ -282,7 +319,6 @@ func (d *dispatcher) drainOnceForPublisher(name string, pub Publisher) {
 					continue
 				}
 
-				// exponential backoff based on failCount, capped
 				backoff := math.Pow(d.config.RetryBackoffFactor, float64(failCount))
 				if backoff < 1 {
 					backoff = 1
@@ -298,19 +334,18 @@ func (d *dispatcher) drainOnceForPublisher(name string, pub Publisher) {
 				continue
 			}
 
-			// on success reset failure count and next attempt
 			d.mu.Lock()
 			d.publisherFailCount[name] = 0
 			d.publisherNextAttempt[name] = time.Time{}
 			d.mu.Unlock()
 
-			// Success: atomically acknowledge this publisher's high-water mark.
-			if err := d.repository.MarkPublished(name, event, d.publisherNames()); err != nil {
-				log.Printf("Failed to mark event %s published for %s: %v", event.ID, name, err)
+			// Success: atomically acknowledge this publisher's high-water mark
+			// for this partition.
+			if err := d.repository.MarkPublished(name, partition, event, d.publisherNames()); err != nil {
+				log.Printf("Failed to mark event %s published for %s partition %d: %v", event.ID, name, partition, err)
 				continue
 			}
 
-			// emit lag metric if available
 			if !event.OccurredAt.IsZero() {
 				if OutboxPublisherLag != nil {
 					lag := time.Since(event.OccurredAt).Seconds()
@@ -425,29 +460,6 @@ func (d *dispatcher) handlePublishError(event *Event, err error) error {
 		return updateErr
 	}
 
-	log.Printf("%s", security.MaskPII(fmt.Sprintf("Event %s retry %d scheduled for %v: %v", security.MaskPII(event.ID.String()), event.RetryCount, nextRetryAt, err)))
+	log.Printf("%s", security.MaskPII(fmt.Sprintf("Event %s scheduled for retry at %v", security.MaskPII(event.ID.String()), nextRetryAt)))
 	return err
-}
-
-// cleanupCompletedEvents removes old completed events
-func (d *dispatcher) cleanupCompletedEvents() {
-	cutoff := time.Now().Add(-d.config.CompletedEventTTL)
-	deleted, err := d.repository.DeleteCompletedEvents(cutoff)
-	if err != nil {
-		log.Printf("%s", security.MaskPII(fmt.Sprintf("Failed to cleanup completed events: %v", err)))
-		return
-	}
-
-	if deleted > 0 {
-		log.Printf("%s", security.MaskPII(fmt.Sprintf("Cleaned up %d completed events older than %v", deleted, cutoff)))
-	}
-}
-
-// TimeoutError represents a processing timeout error
-type TimeoutError struct {
-	msg string
-}
-
-func (e *TimeoutError) Error() string {
-	return e.msg
 }
