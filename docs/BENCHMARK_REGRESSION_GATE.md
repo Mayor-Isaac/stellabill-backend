@@ -1,159 +1,65 @@
 # Benchmark Regression Gate
 
-## Purpose
-
 Every pull request that targets `main` is automatically checked for Go benchmark
-performance regressions.  If **any** tracked benchmark regresses by more than
-**10 %** compared to the `main` baseline, CI fails and the PR cannot be merged.
-
----
+performance regressions. If **any** tracked benchmark regresses by more than
+**10%** compared to the `main` baseline, CI fails and a report is posted as a PR
+comment.
 
 ## How it works
 
-```
-PR opened / updated
-       │
-       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  benchmark-regression-gate.yml  (PR gate job)               │
-│                                                             │
-│  1. go test -bench=. -count=10 ./internal/handlers/...      │
-│     on the PR head  →  /tmp/bench_head.txt                  │
-│                                                             │
-│  2. Download benchmark-baseline-main artifact               │
-│     (uploaded to GitHub Actions by the baseline job)        │
-│     →  /tmp/baseline/bench_baseline.txt                     │
-│                                                             │
-│  3. benchstat baseline head  →  /tmp/benchstat_output.txt   │
-│                                                             │
-│  4. Parse output; fail if any +delta > 10 %                 │
-└─────────────────────────────────────────────────────────────┘
+1. On every push to `main`, the `update-baseline` job runs the benchmark suite
+   and uploads the results as an artifact named `perf-baseline-<sha>`.x
+2. On every PR to `main`, the `enforce-budget` job:
+   - Runs the same benchmark suite on the PR head.
+   - Downloads the baseline artifact for the PR's base SHA.
+   - Uses `benchstat` to compare the two result sets.
+   - Parses the `benchstat` output and fails the job if any whitelisted
+     benchmark regresses by more than the 10% threshold.
+   - Posts a PR comment with the full `benchstat` report.
+   - If the baseline is missing, the gate is skipped with an explanatory PR
+     comment (e.g., first run after this workflow was added).
 
-main push / merge
-       │
-       ▼
-┌──────────────────────────────────────────────────────────┐
-│  update-benchmark-baseline job                           │
-│                                                          │
-│  1. go test -bench=. -count=10 ./internal/handlers/...  │
-│  2. Upload bench_baseline.txt as benchmark-baseline-main │
-│     (retention: 90 days, overwrite: true)               │
-└──────────────────────────────────────────────────────────┘
+## Whitelist
+
+Only the benchmarks listed in `scripts/benchmark_whitelist.txt` are tracked.
+Benchmarks not in the whitelist (or that are new/removed) are ignored, reducing
+fhakky noise.
+
+To add a benchmark to the whitelist, add its name or common prefix to that file.
+For example:
+
+```
+name old time/op new time/op delta
+BenchmarkList_Small 1.00us ± 2% 1.25us ° 3% +13.64% (p=0.000 n=10)
+EOF
+
 ```
 
-### Why `count=10`?
-
-`benchstat` needs multiple samples to compute a confidence interval.  Ten
-samples is sufficient for narrow CI bands while keeping total CI time under
-five minutes for the current suite.
-
-### Why `ubuntu-22.04` (pinned)?
-
-`ubuntu-latest` changes over time.  Hardware differences between image
-generations can shift benchmark results by several percent, which would create
-false positives.  Pinning to `ubuntu-22.04` keeps the runner class stable.
-
----
-
-## Files
-
-| Path | Purpose |
-|------|---------|
-| `.github/workflows/benchmark-regression-gate.yml` | CI workflow (gate + baseline updater) |
-| `scripts/check_benchmark_regression.sh` | Parser used by the workflow; also usable locally |
-| `scripts/check_benchmark_regression_test.sh` | Bash unit tests for the parser |
-| `docs/BENCHMARK_REGRESSION_GATE.md` | This document |
-
----
-
-## Running locally
-
-### Quick smoke test (1 iteration, fast)
+## Local usage
 
 ```bash
-go test -bench=. -benchtime=1x -run=^$ ./internal/handlers/...
-```
-
-### Full comparison (matches CI)
-
-```bash
-# Record main baseline
+# Record a baseline on main
 git checkout main
-go test -bench=. -count=10 -run=^$ ./internal/handlers/... | tee /tmp/base.txt
+go test -bench=. -benchmem -count=10 -timeout=20m ./internal/handlers/... | tee baseline.txt
 
-# Record your branch
+# Run the same suite on your branch
 git checkout my-branch
-go test -bench=. -count=10 -run=^$ ./internal/handlers/... | tee /tmp/head.txt
+go test -bench=. -benchmem -count=10 -timeout=20m ./internal/handlers/... | tee new.txt
 
-# Compare
-benchstat /tmp/base.txt /tmp/head.txt
-
-# Or use the script (mirrors CI logic exactly)
-benchstat /tmp/base.txt /tmp/head.txt | bash scripts/check_benchmark_regression.sh 10
+# Compare (requires benchstat: go install golang.org/x/perf/cmd/benchstat@latest)
+bash scripts/analyze_benchmarks.sh baseline.txt new.txt 1.10 "$(grep -vE '^\\s*' scripts/benchmark_whitelist.txt | paste -t)"
 ```
 
-Install `benchstat` if needed:
+The script exits with code 1 if any whitelisted benchmark regresses more than
+the threshold.
+
+## Tests
+
+Run the unit tests for the analysis script:
 
 ```bash
-go install golang.org/x/perf/cmd/benchstat@latest
+bash scripts/test_analyze_benchmarks.sh
 ```
 
----
-
-## Edge cases
-
-### First run – no baseline exists
-
-On the very first PR after the workflow is added, no `benchmark-baseline-main`
-artifact exists yet.  The gate detects this and **skips the comparison**,
-printing an informational message in the step summary.  The gate does not fail.
-
-After the PR merges, `update-benchmark-baseline` runs on `main` and creates the
-artifact for all future PRs.
-
-### New benchmark added in a PR
-
-`benchstat` marks new benchmarks as `(new)` with no delta column.  The parser
-skips lines without a positive delta, so new benchmarks never trigger a failure.
-
-### Benchmark removed from a PR
-
-`benchstat` marks removed benchmarks as `(gone)`.  These also have no positive
-delta and are skipped.
-
-### Flaky statistical noise
-
-`benchstat` computes a p-value across the 10 samples.  Lines where the change
-is not statistically significant are marked with `~` and no percentage, so they
-are not parsed at all.  The gate only acts on **statistically significant
-regressions** that also exceed the magnitude threshold.
-
-### Artifact expiry (90-day window)
-
-Baseline artifacts are retained for 90 days.  If a baseline expires (e.g., a
-feature branch dormant for >90 days), the gate will skip the comparison and
-succeed on the first run, then record a new baseline after merge.
-
----
-
-## Adjusting the threshold
-
-The threshold is controlled by the workflow env var:
-
-```yaml
-env:
-  REGRESSION_THRESHOLD_PERCENT: "10"
-```
-
-Change it to `15` for a looser gate or `5` for a tighter one.  The script
-accepts it as its first argument, so local usage stays in sync automatically.
-
----
-
-## Running the parser tests
-
-```bash
-bash scripts/check_benchmark_regression_test.sh
-```
-
-Expected output: `9 passed, 0 failed`.
+These tests stub `benchstat` to cover edge cases such as no regressions,
+regressions, non-whitelisted benchmarks, new benchmarks, missing baseline, etc.
