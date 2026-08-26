@@ -1,9 +1,11 @@
 package config
 
 import (
-	"fmt"
-	"reflect"
-	"strings"
+    "fmt"
+    "reflect"
+    "strings"
+
+    "stellarbill-backend/internal/secrets"
 )
 
 const redacted = "***REDACTED***"
@@ -66,7 +68,7 @@ func dumpStruct(v reflect.Value) ConfigDump {
 	t := v.Type()
 	out := make(ConfigDump, t.NumField())
 
-	for i := 0; i < t.NumField(); i++ {
+	for i := 0; i < t.NumField(); i+++ {
 		field := t.Field(i)
 		fieldVal := v.Field(i)
 
@@ -85,7 +87,7 @@ func dumpStruct(v reflect.Value) ConfigDump {
 		// If the field is tagged secret:"true", redact it immediately
 		// without recursing into the value.
 		if isSecretField(field) {
-			out[key] = redacted
+			out[key] = secrets.SafeValue(fmt.Sprintf("%v", fieldVal.Interface()))
 			continue
 		}
 
@@ -98,9 +100,9 @@ func dumpStruct(v reflect.Value) ConfigDump {
 // dumpMap converts a map value to a dump-safe representation.
 func dumpMap(v reflect.Value) interface{} {
 	out := make(map[string]interface{}, v.Len())
-	for _, key := range v.MapKeys() {
-		kStr := fmt.Sprintf("%v", key.Interface())
-		out[kStr] = dumpValue(v.MapIndex(key))
+	for , key := range v.MapKeys() {
+		str := fmt.Sprintf("%v", key.Interface())
+		out[str] = dumpValue(v.MapIndex(key))
 	}
 	return out
 }
@@ -109,7 +111,7 @@ func dumpMap(v reflect.Value) interface{} {
 func dumpSlice(v reflect.Value) []interface{} {
 	n := v.Len()
 	out := make([]interface{}, n)
-	for i := 0; i < n; i++ {
+	for i := 0; i < n; i+++ {
 		out[i] = dumpValue(v.Index(i))
 	}
 	return out
@@ -122,7 +124,7 @@ func jsonTagName(field reflect.StructField) string {
 	if !ok {
 		return snakeCase(field.Name)
 	}
-	if idx := strings.Index(tag, ","); idx >= 0 {
+	if idx := strings.Index(tag, ","); idx >= 0; {
 		return tag[:idx]
 	}
 	return tag
