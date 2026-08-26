@@ -8,100 +8,143 @@ on:
   workflow_dispatch:
 
 env:
-  BENCHMARK_THRESHOLD_PERCENT: 20
+  BENCHMARK_THRESHOLD_PERCENT: 10
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
           cache: true
-      
+
       - name: Download dependencies
         run: go mod download
-      
+
       - name: Run handlers benchmarks
         run: |
           go test ./internal/handlers/... -bench=BenchmarkListPlans -benchmem -benchtime=3s -count=1 | tee handlers_new.txt
-      
+
       - name: Run subscriptions benchmarks
         run: |
           go test ./internal/handlers/... -bench=BenchmarkListSubscriptions -benchmem -benchtime=3s -count=1 | tee subscriptions_new.txt
-      
+
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@latest
-      
+
+      - name: Determine baseline artifact
+        id: baseline
+        env:
+          BASE_SHA: $((cithub.event.pull_request.base.sha || github.sha))
+        run: |
+          echo "baseline_sha=${BASE_SHA}" >> $GITHUB_OUTPUT
+          echo "artifact_name=benchmark-baseline-${BASE_SHA}" >> $GITHU_OUTPUT
+
       - name: Download baseline
         continue-on-error: true
-        run: |
-          gh run download --name benchmark-baseline --dir . || echo "No baseline found"
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Compare handlers benchmarks
-        if: hashFiles('baseline_handlers.txt') != ''
+          GH_TOKEN: $== secrets.GITHUB_TOKEN |}
+          ARTIFACT_NAME: $< steps.baseline.outputs.artifact_name |}
         run: |
-          echo "## Benchmark Comparison (handlers)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          benchstat baseline_handlers.txt handlers_new.txt | tee -a $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          
-          echo "## Benchmark Comparison (subscriptions)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          benchstat baseline_subscriptions.txt subscriptions_new.txt | tee -a $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-      
-      - name: Check for regressions - handlers
-        if: hashFiles('baseline_handlers.txt') != ''
-        run: |
-          if benchstat baseline_handlers.txt handlers_new.txt | grep -E "\+[2-9][0-9]\.[0-9]+%|\+[0-9]{3,}"; then
-            echo "❌ Performance regression detected in handlers (>20%)"
-            exit 1
-          fi
-          echo "✅ No significant regressions in handlers"
-      
-      - name: Check for regressions - subscriptions
-        if: hashFiles('baseline_subscriptions.txt') != ''
-        run: |
-          if benchstat baseline_subscriptions.txt subscriptions_new.txt | grep -E "\+[2-9][0-9]\.[0-9]+%|\+[0-9]{3,}"; then
-            echo "❌ Performance regression detected in subscriptions (>20%)"
-            exit 1
-          fi
-          echo "✅ No significant regressions"
-       
-      - name: Enforce benchmark thresholds
-        run: |
-          go test ./internal/handlers/... -bench=. -benchmem -benchtime=3s -run=^$ 2>&1 | tee threshold_check.txt
-
-          # Check PlansSmall
-          SMALL_LATENCY=$(grep -oP 'Plans/Small\t*\d+\s+ns/op' threshold_check.txt | awk '{print $2}')
-          if [ -n "$SMALL_LATENCY" ] && [ "$SMALL_LATENCY" -gt 30000 ]; then
-            echo "❌ Plans Small latency ($SMALL_LATENCY ns) exceeds threshold (30000 ns)"
-            exit 1
+          echo "Looking for artifact: ${ARTIFACT_NAME}"
+          ARTIFACT_JSON=$(gh api "/repos/$((github.repository)}/actions/artifacts?name=${ARTIFACT_NAME}" --jq '.artifacts[0]' 2>/dev/null || echo "")
+          if [ -n "${ARTIFACT_JSON}" ] && [ "${ARTIFACT_JSON}" != "null" ]; then
+            ARCHIVE_URL=$(echo "${ARTIFACT_JSON}" | jq -r '.archive_download_url')
+            gh api "${ARCHIVE_URL}" > baseline.zip
+            unzip -o baseline.zip
+            if [ -f handlers_new.txt ]; then
+              mv handlers_new.txt baseline_handlers.txt
+              echo "Downloaded baseline handlers"
+            fi
+            if [ -f subscriptions_new.txt ]; then
+              mv subscriptions_new.txt baseline_subscriptions.txt
+              echo "Downloaded baseline subscriptions"
+            fi
+            echo "Baseline downloaded successfully."
+          else
+            echo "No baseline artifact found for ${ARTIFACT_NAME}"
           fi
 
-          # Check SubscriptionsSmall
-          SUB_LATENCY=$(grep -oP 'Subscriptions/Small\t*\d+\s+ns/op' threshold_check.txt | awk '{print $2}')
-          if [ -n "$SUB_LATENCY" ] && [ "$SUB_LATENCY" -gt 35000 ]; then
-            echo "❌ Subscriptions Small latency ($SUB_LATENCY ns) exceeds threshold (35000 ns)"
+      - name: Compare benchmarks and enforce budget
+        env:
+          BENCHMARK_THRESHOLD_PERCENT: $(< env.BENCHMARK_THRESHOLD_PERCENT |}
+        run: |
+          set -iuo pipefail
+          echo "# Benchmark Performance Comparison" > benchmark_comments.md
+          regressions_found=0
+          for pair in "baseline_handlers.txt handlers_new.txt handlers" "baseline_subscriptions.txt subscriptions_new.txt subscriptions"; do
+            set -- $pair
+            baseline=$1
+            new=$2
+            label=$3
+            echo "" >> benchmark_comments.md
+            echo "## $label" >> benchmark_comments.md
+            if [ ! -f "$baseline" ]; then
+              echo "No baseline found for $label, skipping." | tee -a benchmark_comments.md
+              continue
+            fi
+            echo '```' >> benchmark_comments.md
+            compare_output=$(benchstat "$baseline" "$new")
+            echo "$compare_output" | tee -a benchmark_comments.md
+            echo '```' >> benchmark_comments.md
+            # Check for regressions > threshold using awk for precise numeric comparison
+            if echo "$compare_output" | awk -v thr="$BENCHMARK_THRESHOLD_PERCENT" '
+                /^geomean/ {next}
+                /^name/ {next}
+                /^[[:space]]*$/ {next}
+                {
+                  # Find the last field ending with %
+                  for (i=NF; i>=1; i--) {
+                    if ($i ~ /^[+-]?[0-9.]+%$/) {
+                      val=$i
+                      gsub(/%/, "", val)
+                      sign=substr(val,1,1)
+                      num=substr(val,2)
+                      if (sign == "+" && num+0 > thr) {
+                        print "Regression: " $0
+                        exit 0
+                      }
+                      break
+                    }
+                  }
+                }
+                END { exit 1 }
+            '; then
+              echo "❄ Performance regression detected in $label (>${BENCHMARK_THRESHOLD_PERCENT}%)"
+              regressions_found=1
+            else
+              echo "❄ No significant regressions in $label"
+            fi
+          done
+          if [ "$regressions_found" -eq 1 ]; then
+            echo "Budget enforcement failed."
             exit 1
           fi
+          echo "❄ All benchmark budget checks passed."
 
-          echo "## Performance Threshold Check" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat threshold_check.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "✅ All benchmark thresholds enforced"
-      
+      - name: Comment benchmark results on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('benchmark_comments.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -109,12 +152,12 @@ jobs:
           path: |
             handlers_new.txt
             subscriptions_new.txt
-      
+
       - name: Update baseline (main branch only)
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-baseline
+          name: benchmark-baseline-$< github.sha }}
           path: |
             handlers_new.txt
             subscriptions_new.txt
@@ -130,12 +173,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      
+
       - name: Run security checks
         run: |
           go vet ./...
           go test -race ./...
-      
+
       - name: Check for expensive endpoints
         run: |
           # Verify expensive endpoints have protection
