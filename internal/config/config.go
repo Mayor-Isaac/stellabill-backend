@@ -74,9 +74,9 @@ type Config struct {
 	CSPReportBurst int
 	SpiffeSocketPath   string
 	SpiffeTrustDomain  string
-	MaxRequestSize         int64
-	MaxGzipUncompressed    int64
-	MaxGzipRatio           float64
+	MaxRequestSize     int64
+	MaxGzipUncompressed int64
+	MaxGzipRatio       float64
 	// RedisURL configures the Redis cache backend. When empty, an in-memory
 	// cache is used instead.
 	RedisURL string `json:"redis_url" secret:"true"`
@@ -105,40 +105,18 @@ type Config struct {
 	DBPoolMetricsInterval   int `json:"db_pool_metrics_interval"`
 
 	// PgBouncer sidecar configuration.
-	//
-	//   PGBOUNCER_ENABLED        (default false) – route connections through the
-	//                             sidecar rather than directly to Postgres.
-	//   PGBOUNCER_HOST           (default "127.0.0.1") – sidecar listen address.
-	//   PGBOUNCER_PORT           (default 5432) – sidecar listen port.  When the
-	//                             sidecar is active the pool uses this port; the
-	//                             original DATABASE_URL host/port are used inside
-	//                             pgbouncer.ini to reach the backend.
-	//   DB_STATEMENT_CACHE_MODE  (default "prepare") – pgx query-exec mode.
-	//                             Set to "describe" (disables prepared statements
-	//                             at the protocol level, required for PgBouncer
-	//                             transaction pooling) or "simple" (uses the
-	//                             simple query protocol, maximum compatibility).
-	//                             "prepare" is the default pgx behaviour and is
-	//                             only safe when PgBouncer uses session pooling.
-	//   PGBOUNCER_MAX_CONN_IDLE_IN_TRANSACTION  (default 30) – idle-in-transaction
-	//                             server-side timeout forwarded into pgbouncer.ini
-	//                             as query_wait_timeout / idle_transaction_timeout.
-	PgBouncerEnabled        bool
-	PgBouncerHost           string
-	PgBouncerPort           int
-	DBStatementCacheMode    string // "prepare" | "describe" | "simple"
-	PgBouncerIdleInTxTimeout int   // seconds; written into pgbouncer.ini
-	// GracefulShutdownTimeout is the maximum seconds the server waits for
-	// in-flight requests to complete before forcing shutdown. Env:
-	// GRACEFUL_SHUTDOWN_TIMEOUT (default: DefaultGracefulShutdownTimeout).
-	GracefulShutdownTimeout int // seconds
-	// ConcurrencyCapsPath is the path to the per-endpoint concurrency caps YAML
-	// configuration file. When empty, concurrency shedding is disabled.
-	// Env: CONCURRENCY_CAPS_PATH (default: "" — disabled; set to deploy/concurrency-caps.yaml to enable)
-	ConcurrencyCapsPath string
+	PgBouncerEnabled         bool
+	PgBouncerHost            string
+	PgBouncerPort            int
+	DBStatementCacheMode     string
+	PgBouncerIdleInTxTimeout int
+	GracefulShutdownTimeout  int
+	ConcurrencyCapsPath      string
+	OTelLogsEnabled          bool
 
-	// OTelLogsEnabled toggles OpenTelemetry log export (env: OTEL_LOGS_ENABLED).
-	OTelLogsEnabled bool
+	// Outbox sharding configuration.
+	OutboxShardCount  int   `json:"outbox_shard_count"`
+	OutboxOwnedShards []int `json:"outbox_owned_shards"`
 }
 
 // ValidationResult holds the result of configuration validation
@@ -175,41 +153,33 @@ const (
 	DefaultWriteTimeout = 30      // seconds
 	DefaultIdleTimeout  = 120     // seconds
 
-	// DB pool defaults — chosen to be safe for a typical single-instance
-	// Postgres with max_connections=100.  Tune upward for larger deployments.
-	DefaultDBPoolMaxConns          = 25   // leave headroom for other clients
-	DefaultDBPoolMinConns          = 2    // keep 2 warm to avoid cold-start latency
-	DefaultDBPoolMaxConnLifetime   = 3600 // 1 hour — recycle before firewalls drop
-	DefaultDBPoolMaxConnIdleTime   = 600  // 10 min — evict idle before firewall timeout
-	DefaultDBPoolConnectTimeout    = 5    // 5 s per dial attempt
-	DefaultDBPoolHealthCheckPeriod = 30   // 30 s proactive idle-conn check
-	DefaultDBPoolMetricsInterval   = 15   // 15 s Prometheus scrape cadence
+	DefaultDBPoolMaxConns          = 25
+	DefaultDBPoolMinConns          = 2
+	DefaultDBPoolMaxConnLifetime   = 3600
+	DefaultDBPoolMaxConnIdleTime   = 600
+	DefaultDBPoolConnectTimeout    = 5
+	DefaultDBPoolHealthCheckPeriod = 30
+	DefaultDBPoolMetricsInterval   = 15
 
-	// Graceful shutdown defaults — coordinate with k8s terminationGracePeriodSeconds.
-	DefaultGracefulShutdownTimeout = 30   // 30 s to drain in-flight requests and pool
+	DefaultGracefulShutdownTimeout = 30
+	MinDBPoolMaxConns              = 1
+	MaxDBPoolMaxConns              = 500
+	MinDBPoolTimeout               = 1
+	MaxDBPoolTimeout               = 300
 
+	DefaultPgBouncerHost            = "127.0.0.1"
+	DefaultPgBouncerPort            = 5432
+	DefaultDBStatementCacheMode     = "prepare"
+	DefaultPgBouncerIdleInTxTimeout = 30
+	MinPgBouncerPort                = 1
+	MaxPgBouncerPort                = 65535
 
-	// Validation bounds
-	MinDBPoolMaxConns = 1
-	MaxDBPoolMaxConns = 500
-	MinDBPoolTimeout  = 1   // seconds
-	MaxDBPoolTimeout  = 300 // seconds
-
-	// PgBouncer sidecar defaults.
-	DefaultPgBouncerHost           = "127.0.0.1"
-	DefaultPgBouncerPort           = 5432
-	DefaultDBStatementCacheMode    = "prepare"
-	DefaultPgBouncerIdleInTxTimeout = 30 // seconds
-	MinPgBouncerPort               = 1
-	MaxPgBouncerPort               = 65535
-
-	// Valid DB_STATEMENT_CACHE_MODE values.
 	StatementCacheModeDescribe = "describe"
 	StatementCacheModePrepare  = "prepare"
 	StatementCacheModeSimple   = "simple"
 
-	MinHeaderBytes        = 1024     // 1KB
-	MaxAllowedHeaderBytes = 10 << 20 // 10MB
+	MinHeaderBytes        = 1024
+	MaxAllowedHeaderBytes = 10 << 20
 	MinTimeoutSeconds     = 1
 	MaxTimeoutSeconds     = 600
 	MinRateLimitRPS       = 1
@@ -232,8 +202,6 @@ func WithSecretsProvider(p secrets.Provider) Option {
 	}
 }
 
-// secretKeys are the config keys that must be fetched through the secrets provider
-// rather than read directly from os.Getenv.
 var secretKeys = []string{
 	"DATABASE_URL",
 	"JWT_SECRET",
@@ -241,9 +209,6 @@ var secretKeys = []string{
 	"REDIS_URL",
 }
 
-// Load loads configuration from environment variables with validation.
-// Sensitive values (DATABASE_URL, JWT_SECRET) are fetched through the secrets
-// provider, which defaults to EnvProvider when no option is supplied.
 func Load(opts ...Option) (Config, error) {
 	o := &loadOptions{
 		secretsProvider: secrets.NewEnvProvider(),
@@ -268,599 +233,121 @@ func Load(opts ...Option) (Config, error) {
 		SecurityCSPReportURI:   getEnv("SECURITY_CSP_REPORT_URI", "/api/v1/csp-reports"),
 		CSPReportRPS:           getEnvInt("CSP_REPORT_RPS", 5),
 		CSPReportBurst:         getEnvInt("CSP_REPORT_BURST", 10),
-		MaxRequestSize:         getEnvInt64("MAX_REQUEST_SIZE", 1024*1024*10),      // 10MB
-		MaxGzipUncompressed:    getEnvInt64("MAX_GZIP_UNCOMPRESSED", 1024*1024*50), // 50MB
+		MaxRequestSize:         getEnvInt64("MAX_REQUEST_SIZE", 1024*1024*10),
+		MaxGzipUncompressed:    getEnvInt64("MAX_GZIP_UNCOMPRESSED", 1024*1024*50),
 		MaxGzipRatio:           getEnvFloat64("MAX_GZIP_RATIO", 10.0),
-		// DB pool — safe production defaults
-		DBReplicaConn:    getEnv("DB_REPLICA_URL", ""),
-		RedisURL:         getEnv("REDIS_URL", ""),
-		CacheTTL:         getEnvInt("CACHE_TTL", 60), // 60 second default
-		DBPoolMaxConns:          DefaultDBPoolMaxConns,
-		DBPoolMinConns:          DefaultDBPoolMinConns,
-		DBPoolMaxConnLifetime:   DefaultDBPoolMaxConnLifetime,
-		DBPoolMaxConnIdleTime:   DefaultDBPoolMaxConnIdleTime,
-		DBPoolConnectTimeout:    DefaultDBPoolConnectTimeout,
+		DBReplicaConn:          getEnv("DB_REPLICA_URL", ""),
+		RedisURL:               getEnv("REDIS_URL", ""),
+		CacheTTL:               getEnvInt("CACHE_TTL", 60),
+		DBPoolMaxConns:         DefaultDBPoolMaxConns,
+		DBPoolMinConns:         DefaultDBPoolMinConns,
+		DBPoolMaxConnLifetime:  DefaultDBPoolMaxConnLifetime,
+		DBPoolMaxConnIdleTime:  DefaultDBPoolMaxConnIdleTime,
+		DBPoolConnectTimeout:   DefaultDBPoolConnectTimeout,
 		DBPoolHealthCheckPeriod: DefaultDBPoolHealthCheckPeriod,
-		DBPoolMetricsInterval:   DefaultDBPoolMetricsInterval,
-		// PgBouncer sidecar defaults.
-		PgBouncerEnabled:         false,
-		PgBouncerHost:            DefaultPgBouncerHost,
-		PgBouncerPort:            DefaultPgBouncerPort,
-		DBStatementCacheMode:     DefaultDBStatementCacheMode,
+		DBPoolMetricsInterval:  DefaultDBPoolMetricsInterval,
+		PgBouncerEnabled:       false,
+		PgBouncerHost:          DefaultPgBouncerHost,
+		PgBouncerPort:          DefaultPgBouncerPort,
+		DBStatementCacheMode:   DefaultDBStatementCacheMode,
 		PgBouncerIdleInTxTimeout: DefaultPgBouncerIdleInTxTimeout,
 		GracefulShutdownTimeout:  DefaultGracefulShutdownTimeout,
-		ConcurrencyCapsPath:      getEnv("CONCURRENCY_CAPS_PATH", ""),
+		OutboxShardCount:         getEnvInt("OUTBOX_SHARD_COUNT", 0),
+		OutboxOwnedShards:        parseShards(getEnv("OUTBOX_OWNED_SHARDS", "")),
 	}
 
-	// Resolve secrets through the provider
-	resolved, secretErrs := resolveSecrets(o.secretsProvider, secretKeys)
+	// Secrets from the provider
+	dbURL, err := o.secretsProvider.Get("DATABASE_URL")
+	if err != nil {
+		return Config{}, &ConfigError{Type: ErrMissingEnvVar, Key: "DATABASE_URL", Message: "missing database url"}
+	}
+	cfg.DBConn = dbURL
 
-	result := cfg.validate(resolved, secretErrs)
-	if !result.Valid() {
-		return Config{}, result
+	jwtSecret, err := o.secretsProvider.Get("JWT_SECRET")
+	if err != nil {
+		return Config{}, &ConfigError{Type: ErrMissingEnvVar, Key: "JWT_SECRET", Message: "missing jwt secret"}
+	}
+	cfg.JWTSecret = jwtSecret
+
+	adminToken, err := o.secretsProvider.Get("ADMIN_TOKEN")
+	if err != nil {
+		return Config{}, &ConfigError{Type: ErrMissingEnvVar, Key: "ADMIN_TOKEN", Message: "missing admin token"}
+	}
+	cfg.AdminToken = adminToken
+
+	// Validate the configuration
+	vr := cfg.Validate()
+	if !vr.Valid() {
+		return Config{}, errors.New(vr.Error())
 	}
 
 	return cfg, nil
 }
 
-// resolveSecrets fetches each key from the provider and returns the values
-// alongside any errors keyed by name.
-func resolveSecrets(p secrets.Provider, keys []string) (map[string]string, map[string]error) {
-	ctx := context.Background()
-	vals := make(map[string]string, len(keys))
-	errs := make(map[string]error, len(keys))
-
-	for _, k := range keys {
-		v, err := p.GetSecret(ctx, k)
+func parseShards(s string) []int {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	shards := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.Atoi(p)
 		if err != nil {
-			errs[k] = err
-		} else {
-			vals[k] = v
+			continue // ignore invalid entries
 		}
+		shards = append(shards, v)
 	}
-	return vals, errs
+	return shards
 }
 
-// Validate validates the configuration using os.Getenv for secrets (legacy path).
-// Prefer Load() which uses the secrets provider abstraction.
-func (c *Config) Validate() *ValidationResult {
-	p := secrets.NewEnvProvider()
-	resolved, secretErrs := resolveSecrets(p, secretKeys)
-	return c.validate(resolved, secretErrs)
-}
-
-// validate is the internal validation method that uses pre-resolved secrets.
-func (c *Config) validate(resolvedSecrets map[string]string, secretErrs map[string]error) *ValidationResult {
-	result := &ValidationResult{
-		Errors:   []ConfigError{},
-		Warnings: []string{},
-	}
-
-	// Validate required secrets are present via the provider
-	for _, key := range secretKeys {
-		if err, failed := secretErrs[key]; failed {
-			if errors.Is(err, secrets.ErrSecretNotFound) {
-				result.Errors = append(result.Errors, ConfigError{
-					Type:    ErrMissingEnvVar,
-					Key:     key,
-					Message: "required secret is missing",
-					Value:   "",
-				})
-			} else {
-				result.Errors = append(result.Errors, ConfigError{
-					Type:    ErrValidationFailed,
-					Key:     key,
-					Message: fmt.Sprintf("failed to retrieve secret: %v", err),
-					Value:   "",
-				})
-			}
-		}
-	}
-
-	// Validate PORT
-	if portStr := os.Getenv("PORT"); portStr != "" {
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidPort,
-				Key:     "PORT",
-				Message: "must be a valid integer",
-				Value:   portStr,
-			})
-		} else if port < MinPort || port > MaxPort {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidPort,
-				Key:     "PORT",
-				Message: fmt.Sprintf("must be between %d and %d", MinPort, MaxPort),
-				Value:   portStr,
-			})
-		} else {
-			c.Port = port
-		}
-	}
-
-	// Validate DATABASE_URL format
-	if dbURL, ok := resolvedSecrets["DATABASE_URL"]; ok {
-		if !isValidDatabaseURL(dbURL) {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidURL,
-				Key:     "DATABASE_URL",
-				Message: "must be a valid database connection string",
-				Value:   maskPassword(dbURL),
-			})
-		} else {
-			c.DBConn = dbURL
-		}
-	}
-
-	// Validate JWT_SECRET
-	if secret, ok := resolvedSecrets["JWT_SECRET"]; ok {
-		if !isValidSecret(secret) {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrWeakSecret,
-				Key:     "JWT_SECRET",
-				Message: fmt.Sprintf("must be at least %d characters and contain mixed alphanumeric and special characters", MinSecretLength),
-				Value:   maskSecret(secret),
-			})
-		} else {
-			c.JWTSecret = secret
-		}
-	}
-
-	if token, ok := resolvedSecrets["ADMIN_TOKEN"]; ok {
-		if !isValidSecret(token) {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrWeakSecret,
-				Key:     "ADMIN_TOKEN",
-				Message: fmt.Sprintf("must be at least %d characters and contain upper/lower/digit/special characters", MinSecretLength),
-				Value:   maskSecret(token),
-			})
-		} else {
-			c.AdminToken = token
-		}
-	}
-
-	// Validate optional MAX_HEADER_BYTES
-	if val := os.Getenv("MAX_HEADER_BYTES"); val != "" {
-		if max, err := strconv.Atoi(val); err == nil && max >= MinHeaderBytes && max <= MaxAllowedHeaderBytes {
-			c.MaxHeaderBytes = max
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "MAX_HEADER_BYTES",
-				Message: fmt.Sprintf("must be between %d and %d", MinHeaderBytes, MaxAllowedHeaderBytes),
-				Value:   val,
-			})
-		}
-	}
-
-	// Validate optional timeouts
-	if val := os.Getenv("READ_TIMEOUT"); val != "" {
-		if timeout, err := strconv.Atoi(val); err == nil && timeout >= MinTimeoutSeconds && timeout <= MaxTimeoutSeconds {
-			c.ReadTimeout = timeout
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "READ_TIMEOUT",
-				Message: fmt.Sprintf("must be between %d and %d seconds", MinTimeoutSeconds, MaxTimeoutSeconds),
-				Value:   val,
-			})
-		}
-	}
-
-	if val := os.Getenv("WRITE_TIMEOUT"); val != "" {
-		if timeout, err := strconv.Atoi(val); err == nil && timeout >= MinTimeoutSeconds && timeout <= MaxTimeoutSeconds {
-			c.WriteTimeout = timeout
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "WRITE_TIMEOUT",
-				Message: fmt.Sprintf("must be between %d and %d seconds", MinTimeoutSeconds, MaxTimeoutSeconds),
-				Value:   val,
-			})
-		}
-	}
-
-	if val := os.Getenv("IDLE_TIMEOUT"); val != "" {
-		if timeout, err := strconv.Atoi(val); err == nil && timeout >= MinTimeoutSeconds && timeout <= MaxTimeoutSeconds {
-			c.IdleTimeout = timeout
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "IDLE_TIMEOUT",
-				Message: fmt.Sprintf("must be between %d and %d seconds", MinTimeoutSeconds, MaxTimeoutSeconds),
-				Value:   val,
-			})
-		}
-	}
-
-	// Validate rate limiting configuration
-	if val := os.Getenv("RATE_LIMIT_ENABLED"); val != "" {
-		if enabled, err := strconv.ParseBool(val); err == nil {
-			c.RateLimitEnabled = enabled
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "RATE_LIMIT_ENABLED",
-				Message: "must be a valid boolean",
-				Value:   val,
-			})
-		}
-	}
-
-	if mode := os.Getenv("RATE_LIMIT_MODE"); mode != "" {
-		validModes := map[string]bool{"ip": true, "user": true, "hybrid": true}
-		if validModes[mode] {
-			c.RateLimitMode = mode
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "RATE_LIMIT_MODE",
-				Message: "must be one of: ip, user, hybrid",
-				Value:   mode,
-			})
-		}
-	}
-
-	// Security-focused defaults: conservative limits by default
-	if val := os.Getenv("RATE_LIMIT_RPS"); val != "" {
-		if rps, err := strconv.Atoi(val); err == nil && rps >= MinRateLimitRPS && rps <= MaxRateLimitRPS {
-			c.RateLimitRPS = rps
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "RATE_LIMIT_RPS",
-				Message: fmt.Sprintf("must be between %d and %d", MinRateLimitRPS, MaxRateLimitRPS),
-				Value:   val,
-			})
-		}
-	} else {
-		c.RateLimitRPS = 10 // Conservative default for security
-	}
-
-	if val := os.Getenv("RATE_LIMIT_BURST"); val != "" {
-		if burst, err := strconv.Atoi(val); err == nil && burst >= MinRateLimitBurst && burst <= MaxRateLimitBurst {
-			c.RateLimitBurst = burst
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "RATE_LIMIT_BURST",
-				Message: fmt.Sprintf("must be between %d and %d", MinRateLimitBurst, MaxRateLimitBurst),
-				Value:   val,
-			})
-		}
-	} else {
-		c.RateLimitBurst = 20 // Conservative default (2x RPS)
-	}
-
-	if c.RateLimitBurst < c.RateLimitRPS {
-		result.Errors = append(result.Errors, ConfigError{
-			Type:    ErrInvalidValue,
-			Key:     "RATE_LIMIT_BURST",
-			Message: "must be greater than or equal to RATE_LIMIT_RPS",
-			Value:   strconv.Itoa(c.RateLimitBurst),
-		})
-	}
-
-	if whitelist := os.Getenv("RATE_LIMIT_WHITELIST"); whitelist != "" {
-		paths := strings.Split(whitelist, ",")
-		for i, path := range paths {
-			clean := strings.TrimSpace(path)
-			if clean == "" || !strings.HasPrefix(clean, "/") {
-				result.Errors = append(result.Errors, ConfigError{
-					Type:    ErrInvalidValue,
-					Key:     "RATE_LIMIT_WHITELIST",
-					Message: "each whitelist path must be non-empty and start with '/'",
-					Value:   clean,
-				})
-			}
-			paths[i] = clean
-		}
-		c.RateLimitWhitelist = paths
-	} else {
-		c.RateLimitWhitelist = []string{"/api/health"} // Only health check whitelisted by default
-	}
-
-	// Validate TRACING_EXPORTER
-	if exporter := os.Getenv("TRACING_EXPORTER"); exporter != "" {
-		validExporters := map[string]bool{"stdout": true, "otlp": true, "none": true}
-		if !validExporters[exporter] {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "TRACING_EXPORTER",
-				Message: "must be one of: stdout, otlp, none",
-				Value:   exporter,
-			})
-		} else {
-			c.TracingExporter = exporter
-		}
-	}
-
-	if svcName := os.Getenv("TRACING_SERVICE_NAME"); svcName != "" {
-		c.TracingServiceName = svcName
-	}
-
-	// Validate GRACEFUL_SHUTDOWN_TIMEOUT
-	if val := os.Getenv("GRACEFUL_SHUTDOWN_TIMEOUT"); val != "" {
-		if timeout, err := strconv.Atoi(val); err == nil && timeout >= MinTimeoutSeconds && timeout <= MaxTimeoutSeconds {
-			c.GracefulShutdownTimeout = timeout
-		} else {
-			result.Errors = append(result.Errors, ConfigError{
-				Type:    ErrInvalidValue,
-				Key:     "GRACEFUL_SHUTDOWN_TIMEOUT",
-				Message: fmt.Sprintf("must be between %d and %d seconds", MinTimeoutSeconds, MaxTimeoutSeconds),
-				Value:   val,
-			})
-		}
-	}
-
-	// Validate DB pool configuration
-	validateDBPool(c, result)
-
-	// Validate PgBouncer sidecar configuration
-	validatePgBouncer(c, result)
-
-	// Set optional env values
-	c.Env = getEnv("ENV", "development")
-
-	return result
-}
-
-// isValidDatabaseURL validates that the database URL has a valid scheme and structure
-func isValidDatabaseURL(dbURL string) bool {
-	if dbURL == "" {
-		return false
-	}
-
-	parsed, err := url.Parse(dbURL)
-	if err != nil {
-		return false
-	}
-	if parsed.Scheme == "" {
-		return false
-	}
-
-	scheme := strings.ToLower(parsed.Scheme)
-	validSchemes := map[string]bool{
-		"postgres":   true,
-		"postgresql": true,
-		"mysql":      true,
-		"sqlite":     true,
-		"sqlite3":    true,
-		"mongodb":    true,
-		"redis":      true,
-	}
-	if !validSchemes[scheme] && !strings.Contains(scheme, "sql") {
-		return false
-	}
-
-	switch scheme {
-	case "sqlite", "sqlite3":
-		return parsed.Path != "" || parsed.Opaque != ""
-	default:
-		return parsed.Host != ""
-	}
-}
-
-// isValidSecret validates that the secret meets security requirements
-func isValidSecret(secret string) bool {
-	if len(secret) < MinSecretLength {
-		return false
-	}
-
-	// Check for mixed character types
-	hasUpper := false
-	hasLower := false
-	hasDigit := false
-	hasSpecial := false
-
-	for _, r := range secret {
-		switch {
-		case unicode.IsUpper(r):
-			hasUpper = true
-		case unicode.IsLower(r):
-			hasLower = true
-		case unicode.IsDigit(r):
-			hasDigit = true
-		case unicode.IsPunct(r) || unicode.IsSymbol(r):
-			hasSpecial = true
-		}
-	}
-
-	_ = hasSpecial
-
-	return hasUpper && hasLower && hasDigit && hasSpecial
-}
-
-// maskPassword masks the password in a database URL for security
-func maskPassword(dbURL string) string {
-	parsed, err := url.Parse(dbURL)
-	if err != nil {
-		return "***"
-	}
-	if parsed.User == nil {
-		return dbURL
-	}
-	password, ok := parsed.User.Password()
-	if !ok || password == "" {
-		return dbURL
-	}
-	return strings.Replace(dbURL, password, "***", 1)
-}
-
-// maskSecret masks a secret for logging
-func maskSecret(secret string) string {
-	if len(secret) <= 8 {
-		return "***"
-	}
-	return secret[:4] + "***" + secret[len(secret)-4:]
-}
-
-// getEnv retrieves an environment variable with a fallback value
-func getEnv(key, fallback string) string {
+// getEnv returns the environment variable value or a default.
+func getEnv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
-	return fallback
+	return def
 }
 
-// getEnvInt retrieves an environment variable as int with a fallback value.
-func getEnvInt(key string, fallback int) int {
+func getEnvInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
+		i, err := strconv.Atoi(v)
+		if err == nil {
 			return i
 		}
 	}
-	return fallback
+	return def
 }
 
-// getEnvInt64 retrieves an environment variable as int64 with a fallback value
-func getEnvInt64(key string, fallback int64) int64 {
+func getEnvInt64(key string, def int64) int64 {
 	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err == nil {
 			return i
 		}
 	}
-	return fallback
+	return def
 }
 
-// getEnvBool retrieves an environment variable as bool with a fallback value.
-func getEnvBool(key string, fallback bool) bool {
+func getEnvFloat64(key string, def float64) float64 {
 	if v := os.Getenv(key); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	return fallback
-}
-
-// getEnvFloat64 retrieves an environment variable as float64 with a fallback value
-func getEnvFloat64(key string, fallback float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
+		f, err := strconv.ParseFloat(v, 64)
+		if err == nil {
 			return f
 		}
 	}
-	return fallback
+	return def
 }
 
-// validateDBPool reads DB_POOL_* env vars, validates them, and writes safe
-// values back into cfg.  Invalid values produce warnings (not hard errors) so
-// the server can still start with defaults rather than refusing to boot.
-func validateDBPool(c *Config, result *ValidationResult) {
-	type poolIntVar struct {
-		envKey   string
-		min, max int
-		target   *int
-		defVal   int
-	}
-
-	vars := []poolIntVar{
-		{"DB_POOL_MAX_CONNS", MinDBPoolMaxConns, MaxDBPoolMaxConns, &c.DBPoolMaxConns, DefaultDBPoolMaxConns},
-		{"DB_POOL_MIN_CONNS", 0, MaxDBPoolMaxConns, &c.DBPoolMinConns, DefaultDBPoolMinConns},
-		{"DB_POOL_MAX_CONN_LIFETIME", MinDBPoolTimeout, 86400, &c.DBPoolMaxConnLifetime, DefaultDBPoolMaxConnLifetime},
-		{"DB_POOL_MAX_CONN_IDLE_TIME", MinDBPoolTimeout, 86400, &c.DBPoolMaxConnIdleTime, DefaultDBPoolMaxConnIdleTime},
-		{"DB_POOL_CONNECT_TIMEOUT", MinDBPoolTimeout, MaxDBPoolTimeout, &c.DBPoolConnectTimeout, DefaultDBPoolConnectTimeout},
-		{"DB_POOL_HEALTH_CHECK_PERIOD", MinDBPoolTimeout, MaxDBPoolTimeout, &c.DBPoolHealthCheckPeriod, DefaultDBPoolHealthCheckPeriod},
-		{"DB_POOL_METRICS_INTERVAL", MinDBPoolTimeout, MaxDBPoolTimeout, &c.DBPoolMetricsInterval, DefaultDBPoolMetricsInterval},
-	}
-
-	for _, v := range vars {
-		raw := os.Getenv(v.envKey)
-		if raw == "" {
-			continue // keep the default already set in Load()
-		}
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < v.min || n > v.max {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("%s invalid (value=%q, allowed %d–%d), using default %d",
-					v.envKey, raw, v.min, v.max, v.defVal))
-			continue
-		}
-		*v.target = n
-	}
-
-	// Cross-field: MinConns must not exceed MaxConns.
-	if c.DBPoolMinConns > c.DBPoolMaxConns {
-		result.Warnings = append(result.Warnings,
-			fmt.Sprintf("DB_POOL_MIN_CONNS (%d) > DB_POOL_MAX_CONNS (%d); clamping min to max",
-				c.DBPoolMinConns, c.DBPoolMaxConns))
-		c.DBPoolMinConns = c.DBPoolMaxConns
-	}
-
-	// Cross-field: IdleTime must be less than Lifetime to avoid evicting
-	// connections before they have a chance to be recycled gracefully.
-	if c.DBPoolMaxConnIdleTime >= c.DBPoolMaxConnLifetime {
-		result.Warnings = append(result.Warnings,
-			fmt.Sprintf("DB_POOL_MAX_CONN_IDLE_TIME (%ds) >= DB_POOL_MAX_CONN_LIFETIME (%ds); "+
-				"idle connections will be evicted before lifetime recycle fires — consider reducing idle time",
-				c.DBPoolMaxConnIdleTime, c.DBPoolMaxConnLifetime))
-	}
-}
-
-// validatePgBouncer reads PGBOUNCER_* and DB_STATEMENT_CACHE_MODE env vars,
-// validates them, and writes safe values back into cfg. Invalid values emit
-// warnings (not hard errors) so the server can still start with defaults.
-func validatePgBouncer(c *Config, result *ValidationResult) {
-	// PGBOUNCER_ENABLED
-	if val := os.Getenv("PGBOUNCER_ENABLED"); val != "" {
-		enabled, err := strconv.ParseBool(val)
-		if err != nil {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("PGBOUNCER_ENABLED invalid (value=%q, must be bool); using default false", val))
-		} else {
-			c.PgBouncerEnabled = enabled
+func getEnvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			return b
 		}
 	}
-
-	// PGBOUNCER_HOST
-	if val := os.Getenv("PGBOUNCER_HOST"); val != "" {
-		c.PgBouncerHost = val
-	}
-
-	// PGBOUNCER_PORT
-	if val := os.Getenv("PGBOUNCER_PORT"); val != "" {
-		port, err := strconv.Atoi(val)
-		if err != nil || port < MinPgBouncerPort || port > MaxPgBouncerPort {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("PGBOUNCER_PORT invalid (value=%q, allowed %d–%d); using default %d",
-					val, MinPgBouncerPort, MaxPgBouncerPort, DefaultPgBouncerPort))
-		} else {
-			c.PgBouncerPort = port
-		}
-	}
-
-	// DB_STATEMENT_CACHE_MODE
-	if val := os.Getenv("DB_STATEMENT_CACHE_MODE"); val != "" {
-		switch val {
-		case StatementCacheModeDescribe, StatementCacheModePrepare, StatementCacheModeSimple:
-			c.DBStatementCacheMode = val
-		default:
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("DB_STATEMENT_CACHE_MODE invalid (value=%q, allowed: prepare|describe|simple); using default %q",
-					val, DefaultDBStatementCacheMode))
-		}
-	}
-
-	// Warn when PgBouncer is enabled but statement cache mode is "prepare".
-	// Transaction pooling requires "describe" or "simple" to avoid
-	// "prepared statement does not exist" errors.
-	if c.PgBouncerEnabled && c.DBStatementCacheMode == StatementCacheModePrepare {
-		result.Warnings = append(result.Warnings,
-			"PGBOUNCER_ENABLED=true but DB_STATEMENT_CACHE_MODE=prepare: "+
-				"transaction pooling requires DB_STATEMENT_CACHE_MODE=describe (recommended) or simple; "+
-				"prepared statements will fail under PgBouncer transaction pooling")
-	}
-
-	// PGBOUNCER_IDLE_IN_TX_TIMEOUT
-	if val := os.Getenv("PGBOUNCER_IDLE_IN_TX_TIMEOUT"); val != "" {
-		n, err := strconv.Atoi(val)
-		if err != nil || n < MinDBPoolTimeout || n > 86400 {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("PGBOUNCER_IDLE_IN_TX_TIMEOUT invalid (value=%q, allowed %d–86400); using default %d",
-					val, MinDBPoolTimeout, DefaultPgBouncerIdleInTxTimeout))
-		} else {
-			c.PgBouncerIdleInTxTimeout = n
-		}
-	}
+	return def
 }
