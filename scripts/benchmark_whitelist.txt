@@ -1,0 +1,6 @@
+# Benchmark whitelist for performance budget enforcement.
+# Only benchmarks matching these prefixes are tracked.
+# Add stable benchmarks here to avoid flaky noise.
+
+BenchmarkListPlans
+BenchmarkListSubscriptions
