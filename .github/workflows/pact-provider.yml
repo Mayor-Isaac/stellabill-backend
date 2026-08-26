@@ -1,0 +1,13 @@
+name: Pact Provider Verification
+on: pull_request
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test -tags=pact ./tests/pact/...
+        env:
+          PACT_BROKER_BASE_URL: ${{secrets.PACT_BROKER_URL}}
+          PACT_BROKER_TOKEN: ${{secrets.PACT_BROKER_TOKEN}}
+          PACT_PROVIDER: provider
+          PACT_PUBLISH_VERIFICATION_RESULTS: true
